@@ -1,0 +1,22 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Virtual environment
+.venv/
+
+# Editor
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# ADK runtime artifacts (local session state)
+.adk/
+*.db
+
+# Output written by research_agent's report_writer_tool
+*_report.txt
+report.txt
