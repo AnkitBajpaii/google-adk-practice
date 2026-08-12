@@ -3,11 +3,18 @@
 .env.*
 !.env.example
 
-# Virtual environment
+# Virtual environment (recreated by `uv sync`)
 .venv/
+
+# NOTE: uv.lock, pyproject.toml and .python-version are intentionally NOT
+# ignored — they are what make a fresh clone reproducible.
 
 # Editor
 .vscode/
+.idea/
+
+# OS
+.DS_Store
 
 # Python
 __pycache__/
