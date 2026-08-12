@@ -1,13 +1,18 @@
+"""The simplest end-to-end example: one LLM agent plus a search sub-agent.
+
+Start here. `google_search_agent` is wrapped in `AgentTool`, which turns a whole
+agent into a callable tool for another agent.
+"""
+
 import asyncio
-from uuid import uuid4
+
 from dotenv import load_dotenv
 from google.adk.agents.llm_agent import Agent
-from google.adk.events import Event
+from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService, Session
-from google.genai.types import Content, Part
 from google.adk.tools.agent_tool import AgentTool
-from google.adk.models.lite_llm import LiteLlm
+from google.genai.types import Content, Part
 
 load_dotenv()
 
@@ -24,7 +29,8 @@ def get_openai_llm():
 
 # ADK's built-in `google_search` is a Gemini-side tool and cannot be used with an
 # OpenAI model. The *-search-preview models do web search server-side at OpenAI
-# instead, so no search tool is declared here(gpt-4o-search-preview rejects function calling) and only OPENAI_API_KEY is needed.
+# instead, so no search tool is declared here (gpt-4o-search-preview rejects
+# function calling) and only OPENAI_API_KEY is needed.
 # drop_params lets LiteLLM discard params these models reject (e.g. temperature).
 google_search_agent = Agent(
     name="web_searcher",
@@ -46,7 +52,7 @@ day_trip_agent = Agent(
         Transform a simple mood or interest into a complete day-trip adventure with real-time details, while respecting a budget.
 
         Guidelines:
-        1. **Budget-Aware**: Pay close attention to budget hints like 'cheap', 'affordable', or 'splurge'. Use Google Search to find activities (free museums, parks, paid attractions) that match the user's budget.
+        1. **Budget-Aware**: Pay close attention to budget hints like 'cheap', 'affordable', or 'splurge'. Use the `web_searcher` tool to find activities (free museums, parks, paid attractions) that match the user's budget.
         2. **Full-Day Structure**: Create morning, afternoon, and evening activities.
         3. **Real-Time Focus**: Look up current operating hours, admission prices, and special events for each venue you recommend.
         4. **Mood Matching**: Align suggestions with the requested mood (adventurous, relaxing, artsy, etc.).
@@ -57,22 +63,9 @@ day_trip_agent = Agent(
     tools=[AgentTool(google_search_agent)],
 )
 
+root_agent = day_trip_agent  # discovered by `adk web`
+
 print(f"🧞 Agent '{day_trip_agent.name}' is created and ready for adventure!")
-
-
-async def run_day_trip_agent():
-
-    session = await session_service.create_session(
-        app_name=day_trip_agent.name,
-        user_id=my_user_id,
-    )
-
-    query = (
-        "Plan a relaxing and artsy day trip near Hyderabad, India. Keep it affordable!"
-    )
-    print(f"User Query : '{query}'")
-
-    await run_agent_query(day_trip_agent, query, session, my_user_id)
 
 
 async def run_agent_query(
@@ -106,18 +99,27 @@ async def run_agent_query(
     if not is_router:
         print("\n" + "-" * 50)
         print("✅ Final Response:")
-        # display(Markdown(final_response))
         print(final_response)
         print("-" * 50 + "\n")
 
     return final_response
 
 
-root_agent = day_trip_agent  # to discover this agent via adk web
+async def run_day_trip_agent():
+    session = await session_service.create_session(
+        app_name=day_trip_agent.name,
+        user_id=my_user_id,
+    )
+
+    query = (
+        "Plan a relaxing and artsy day trip near Hyderabad, India. Keep it affordable!"
+    )
+    print(f"User Query : '{query}'")
+
+    await run_agent_query(day_trip_agent, query, session, my_user_id)
 
 
 async def main() -> None:
-
     await run_day_trip_agent()
 
 

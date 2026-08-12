@@ -1,23 +1,24 @@
-import re
-import os
-import sys
-import json
+"""Workflow patterns: Sequential, Loop (critique/refine), and Parallel.
+
+Also shows two ways to route a request:
+  * an LLM router that returns a name, dispatched by Python (see `main`)
+  * an `AgentTool`-based router exposed as `root_agent` for the `adk web` UI
+
+NOTE: ADK 2.6.x emits a DeprecationWarning for SequentialAgent/LoopAgent/
+ParallelAgent in favour of the newer `Workflow` API. They still work, and the
+course teaches these, so they are kept here deliberately.
+"""
+
 import asyncio
-import random
-import string
-from uuid import uuid4
+
 from dotenv import load_dotenv
-from google.adk.agents import Agent, LoopAgent, SequentialAgent, ParallelAgent
-from google.adk.events import Event
-from google.adk.runners import Runner
-import google.adk as adk
-from google.adk.tools import google_search, ToolContext
-from google.adk.sessions import InMemorySessionService, Session
-from google.genai import types
-from google.genai.types import Content, Part
-from google.adk.tools.agent_tool import AgentTool
+from google.adk.agents import Agent, LoopAgent, ParallelAgent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
-from google.adk.tools.google_search_tool import GoogleSearchTool
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService, Session
+from google.adk.tools import ToolContext
+from google.adk.tools.agent_tool import AgentTool
+from google.genai.types import Content, Part
 
 load_dotenv()
 
@@ -32,7 +33,8 @@ def get_openai_llm():
 
 # ADK's built-in `google_search` is a Gemini-side tool and cannot be used with an
 # OpenAI model. The *-search-preview models do web search server-side at OpenAI
-# instead, so no search tool is declared here(gpt-4o-search-preview rejects function calling) and only OPENAI_API_KEY is needed.
+# instead, so no search tool is declared here (gpt-4o-search-preview rejects
+# function calling) and only OPENAI_API_KEY is needed.
 # drop_params lets LiteLLM discard params these models reject (e.g. temperature).
 google_search_agent = Agent(
     name="web_searcher",
@@ -43,27 +45,37 @@ google_search_agent = Agent(
     # no tools — search happens server-side at OpenAI
 )
 
-# --- Agent Definitions for our Specialist Team (Refactored for Sequential Workflow) ---
+# --- Agent Definitions for our Specialist Team (Sequential Workflow) ---
 
-# ✨ CHANGE 1: We tell foodie_agent to save its output to the shared state.
-# Note the new `output_key` and the more specific instruction.
-foodie_agent = Agent(
-    name="foodie_agent",
-    model=get_openai_llm(),
-    tools=[AgentTool(google_search_agent)],
-    instruction="""You are an expert food critic. Your goal is to find the best restaurant based on a user's request
-    When you recommend a place, you must output *only* the name of the establishment and nothing else.
-    For example, if the best sushi is at 'Jin Sho', you should output only: Jin Sho
-    """,
-    output_key="destination",  # ADK will save the agent's final response to state['destination']
-)
+# An ADK agent may only have ONE parent, and `model_copy` carries `parent_agent`
+# along with it — so copying an agent that is already a sub_agent and adding the
+# copy to another workflow raises "already has a parent agent". Build each
+# instance from a factory instead.
+def make_foodie_agent(name: str = "foodie_agent", output_key: str | None = None) -> Agent:
+    """Builds a fresh food-critic agent. `output_key` writes its answer to state."""
+    return Agent(
+        name=name,
+        model=get_openai_llm(),
+        tools=[AgentTool(google_search_agent)],
+        description="Finds the single best restaurant for a request.",
+        instruction="""You are an expert food critic. Your goal is to find the best restaurant based on a user's request
+        When you recommend a place, you must output *only* the name of the establishment and nothing else.
+        For example, if the best sushi is at 'Jin Sho', you should output only: Jin Sho
+        """,
+        output_key=output_key,
+    )
 
-# ✨ CHANGE 2: We tell transportation_agent to read from the shared state.
-# The `{destination}` placeholder is automatically filled by the ADK from the state.
+
+# Saves its output to state['destination'] for the next agent in the sequence.
+foodie_agent = make_foodie_agent(output_key="destination")
+
+# The `{destination}` placeholder is filled by ADK from state. This only resolves
+# inside the sequence below, where foodie_agent runs first and sets it.
 transportation_agent = Agent(
     name="transportation_agent",
     model=get_openai_llm(),
     tools=[AgentTool(google_search_agent)],
+    description="Gives directions to a destination held in state.",
     instruction="""You are a navigation assistant. Given a destination, provide clear directions.
     The user wants to go to: {destination}.
 
@@ -72,19 +84,15 @@ transportation_agent = Agent(
     """,
 )
 
-# ✨ CHANGE 3: Define the SequentialAgent to manage the workflow.
-# This agent will run foodie_agent, then transportation_agent, in that exact order.
+# Runs foodie_agent, then transportation_agent, in that exact order.
 find_and_navigate_agent = SequentialAgent(
     name="find_and_navigate_agent",
     sub_agents=[foodie_agent, transportation_agent],
     description="A workflow that first finds a location and then provides directions to it.",
 )
 
-print("🤖 Agent team assembled with a SequentialAgent workflow!")
-
 # --- Agent Definitions for an Iterative Workflow ---
 
-# A tool to signal that the loop should terminate
 COMPLETION_PHRASE = "The plan is feasible and meets all constraints."
 
 
@@ -96,10 +104,11 @@ def exit_loop(tool_context: ToolContext):
 
 
 # Agent 1: Proposes an initial plan
-planner_Agent = Agent(
-    name="planner_Agent",
+planner_agent = Agent(
+    name="planner_agent",
     model=get_openai_llm(),
     tools=[AgentTool(google_search_agent)],
+    description="Proposes an initial activity/restaurant pair.",
     instruction="You are a trip planner. Based on the user's request, propose a single activity and a single restaurant. Output only the names, like: 'Activity: Exploratorium, Restaurant: La Mar'.",
     output_key="current_plan",
 )
@@ -109,6 +118,7 @@ critic_agent = Agent(
     name="critic_agent",
     model=get_openai_llm(),
     tools=[AgentTool(google_search_agent)],
+    description="Critiques a plan against a travel-time constraint.",
     instruction=f"""You are a logistics expert. Your job is to critique a travel plan. The user has a strict constraint: total travel time must be short.
     Current Plan: {{current_plan}}
     Use your tools to check the travel time between the two locations.
@@ -117,93 +127,97 @@ critic_agent = Agent(
     output_key="criticism",
 )
 
-# Agent 3 (in loop): Refines the plan or exits
+# Agent 3 (in loop): Refines the plan or exits.
+# The original request is already in the conversation history, so there is no
+# `{session.query}` state key to interpolate — ADK would leave such a placeholder
+# in the prompt verbatim, since a name containing '.' is not a valid state key.
 refiner_agent = Agent(
     name="refiner_agent",
     model=get_openai_llm(),
     tools=[AgentTool(google_search_agent), exit_loop],
+    description="Refines a plan based on criticism, or ends the loop.",
     instruction=f"""You are a trip planner, refining a plan based on criticism.
-    Original Request: {{session.query}}
+    Refer to the user's original request in the conversation above.
+    Current Plan: {{current_plan}}
     Critique: {{criticism}}
     IF the critique is '{COMPLETION_PHRASE}', you MUST call the 'exit_loop' tool.
     ELSE, generate a NEW plan that addresses the critique. Output only the new plan names, like: 'Activity: de Young Museum, Restaurant: Nopa'.""",
     output_key="current_plan",
 )
 
-# ✨ The LoopAgent orchestrates the critique-refine cycle ✨
 refinement_loop = LoopAgent(
     name="refinement_loop", sub_agents=[critic_agent, refiner_agent], max_iterations=3
 )
 
-# ✨ The SequentialAgent puts it all together
 iterative_planner_agent = SequentialAgent(
     name="iterative_planner_agent",
-    sub_agents=[planner_Agent, refinement_loop],
+    sub_agents=[planner_agent, refinement_loop],
     description="A workflow that iteratively plans and refines a trip to meet constraints.",
 )
 
-print("🤖 Agent team updated with an iterative LoopAgent workflow!")
-
 # --- Agent Definitions for a Parallel Workflow ---
 
-# Specialist Agent 1
 museum_finder_agent = Agent(
     name="museum_finder_agent",
     model=get_openai_llm(),
     tools=[AgentTool(google_search_agent)],
+    description="Finds the best museum for a request.",
     instruction="You are a museum expert. Find the best museum based on the user's query. Output only the museum's name.",
     output_key="museum_result",
 )
 
-# Specialist Agent 2
 concert_finder_agent = Agent(
     name="concert_finder_agent",
     model=get_openai_llm(),
     tools=[AgentTool(google_search_agent)],
+    description="Finds a concert for a request.",
     instruction="You are an events guide. Find a concert based on the user's query. Output only the concert name and artist.",
     output_key="concert_result",
 )
 
-# We can reuse our foodie_agent for the third parallel task!
-# Just need to give it a new output_key for this workflow.
-restaurant_finder_agent = foodie_agent.model_copy(
-    update={"output_key": "restaurant_result", "name": "restaurant_finder_agent"}
+# A *fresh* foodie agent for the parallel branch — see make_foodie_agent above.
+restaurant_finder_agent = make_foodie_agent(
+    name="restaurant_finder_agent", output_key="restaurant_result"
 )
-
-# ✨ The ParallelAgent runs all three specialists at once ✨
 
 parallel_research_agent = ParallelAgent(
     name="parallel_research_agent",
     sub_agents=[museum_finder_agent, concert_finder_agent, restaurant_finder_agent],
+    description="Finds a museum, a concert and a restaurant concurrently.",
 )
 
-# Agent to synthesize the parallel results
+# The `?` suffix marks a state key optional. Without it, a branch that failed
+# to produce its output_key raises KeyError here and takes down the whole run;
+# with it, the placeholder renders empty and we still report what did succeed.
 synthesis_agent = Agent(
     name="synthesis_agent",
     model=get_openai_llm(),
-    instruction=f"""You are a helpful assistant. Combine the following research results into a clear, bulleted list for the user.
-    - Museum: {{museum_result}}
-    - Concert: {{concert_result}}
-    - Restaurant: {{restaurant_result}}
+    description="Combines the parallel research results into one answer.",
+    instruction="""You are a helpful assistant. Combine the following research results into a clear, bulleted list for the user.
+    - Museum: {museum_result?}
+    - Concert: {concert_result?}
+    - Restaurant: {restaurant_result?}
+
+    If one of these is blank, that search failed — say so for that item instead of inventing a result.
     """,
 )
 
-# ✨ The SequentialAgent runs the parallel search, then the synthesis ✨
 parallel_planner_agent = SequentialAgent(
     name="parallel_planner_agent",
     sub_agents=[parallel_research_agent, synthesis_agent],
     description="A workflow that finds multiple things in parallel and then summarizes the results.",
 )
 
-# For simple weekend guide
+# --- Simple single-purpose agents ---
+
 weekend_guide_agent = Agent(
     name="weekend_guide_agent",
     model=get_openai_llm(),
+    description="Finds events happening on a specific weekend.",
     tools=[AgentTool(google_search_agent)],
     instruction="You are a local events guide. Your task is to find interesting events, concerts, festivals, and activities happening on a specific weekend.",
 )
 
-# For simple day trip planner
 day_trip_agent = Agent(
     name="day_trip_agent",
     model=get_openai_llm(),
@@ -215,7 +229,7 @@ day_trip_agent = Agent(
     Transform a simple mood or interest into a complete day-trip adventure with real-time details, while respecting a budget.
 
     Guidelines:
-    1. **Budget-Aware**: Pay close attention to budget hints like 'cheap', 'affordable', or 'splurge'. Use Google Search to find activities (free museums, parks, paid attractions) that match the user's budget.
+    1. **Budget-Aware**: Pay close attention to budget hints like 'cheap', 'affordable', or 'splurge'. Use the `web_searcher` tool to find activities (free museums, parks, paid attractions) that match the user's budget.
     2. **Full-Day Structure**: Create morning, afternoon, and evening activities.
     3. **Real-Time Focus**: Search for current operating hours and special events.
     4. **Mood Matching**: Align suggestions with the requested mood (adventurous, relaxing, artsy, etc.).
@@ -225,10 +239,12 @@ day_trip_agent = Agent(
     tools=[AgentTool(google_search_agent)],
 )
 
-# We update the router to know about our new, powerful SequentialAgent.
+# --- Routing, approach 1: an LLM picks a name, Python dispatches ---
+
 router_agent = Agent(
     name="router_agent",
     model=get_openai_llm(),
+    description="Chooses which agent or workflow should handle a request.",
     instruction="""
     You are a request router. Your job is to analyze a user's query and decide which of the following agents or workflows is best suited to handle it.
     Do not answer the query yourself, only return the name of the most appropriate choice.
@@ -245,16 +261,48 @@ router_agent = Agent(
     """,
 )
 
-# We create a dictionary of all our executable agents for easy lookup.
-# This now includes our powerful new workflow agent!
+# A standalone foodie agent for direct routing. It must NOT be the same object as
+# the one inside find_and_navigate_agent, which already has a parent.
+standalone_foodie_agent = make_foodie_agent()
+
 worker_agents = {
     "day_trip_agent": day_trip_agent,
     "weekend_guide_agent": weekend_guide_agent,
-    "foodie_agent": foodie_agent,  # For simple food queries
+    "foodie_agent": standalone_foodie_agent,
     "find_and_navigate_agent": find_and_navigate_agent,  # sequential agent
     "iterative_planner_agent": iterative_planner_agent,  # loop agent
     "parallel_planner_agent": parallel_planner_agent,  # parallel agent
 }
+
+# --- Routing, approach 2: AgentTool wrappers, usable from `adk web` ---
+# AgentTool does not claim parentage of the agent it wraps, so the same workflow
+# objects can be exposed here as well as dispatched by `main()` above.
+workflow_router_agent = Agent(
+    name="workflow_router",
+    model=get_openai_llm(),
+    description="Top-level entry point that delegates to the right workflow.",
+    instruction="""
+    You are a travel assistant with a team of specialist workflows available as tools.
+    Choose exactly ONE tool that best fits the user's request, call it, and present its result.
+
+    - `foodie_agent`: queries *only* about food or restaurants.
+    - `weekend_guide_agent`: events or activities in a specific timeframe.
+    - `day_trip_agent`: general day-trip planning.
+    - `find_and_navigate_agent`: find a place, THEN get directions to it.
+    - `iterative_planner_agent`: planning with a constraint to verify, like travel time.
+    - `parallel_planner_agent`: find several independent things at once.
+    """,
+    tools=[
+        AgentTool(standalone_foodie_agent),
+        AgentTool(weekend_guide_agent),
+        AgentTool(day_trip_agent),
+        AgentTool(find_and_navigate_agent),
+        AgentTool(iterative_planner_agent),
+        AgentTool(parallel_planner_agent),
+    ],
+)
+
+root_agent = workflow_router_agent  # discovered by `adk web`
 
 
 async def run_agent_query(
@@ -289,7 +337,6 @@ async def run_agent_query(
     if not is_router:
         print("\n" + "-" * 50)
         print("✅ Final Response:")
-        # display(Markdown(final_response))
         print(final_response)
         print("-" * 50 + "\n")
 
@@ -335,7 +382,6 @@ async def run_fully_loaded_app():
 
 
 async def main() -> None:
-
     await run_fully_loaded_app()
 
 

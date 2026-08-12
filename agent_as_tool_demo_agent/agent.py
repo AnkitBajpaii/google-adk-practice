@@ -1,38 +1,38 @@
-import os
-import sys
-import json
+"""Nested orchestration: async tool functions that invoke AgentTool.run_async.
+
+Two things to notice:
+  * a tool function can itself drive another agent, via `AgentTool.run_async`
+  * `tool_context.state` carries data from one tool call to the next, so the
+    second tool can build on what the first one fetched
+"""
+
 import asyncio
-import random
-import string
-from uuid import uuid4
+
 from dotenv import load_dotenv
 from google.adk.agents.llm_agent import Agent
-from google.adk.events import Event
-from google.adk.runners import Runner
-import google.adk as adk
-from google.adk.tools import google_search, ToolContext
-from google.adk.sessions import InMemorySessionService, Session
-from google.genai import types
-from google.genai.types import Content, Part
-from google.adk.tools.agent_tool import AgentTool
 from google.adk.models.lite_llm import LiteLlm
-from google.adk.tools.google_search_tool import GoogleSearchTool
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService, Session
+from google.adk.tools import ToolContext
+from google.adk.tools.agent_tool import AgentTool
+from google.genai.types import Content, Part
 
 load_dotenv()
 
 session_service = InMemorySessionService()
 my_user_id = "abajpai"
 
-# Assume 'db_agent' is a pre-defined NL2SQL Agent
-# For this example, we'll create placeholder agents.
 
 def get_openai_llm():
     openai_llm = LiteLlm(model="openai/gpt-4o")
     return openai_llm
 
+
+# Stands in for a real NL2SQL agent so the example needs no database.
 db_agent = Agent(
     name="db_agent",
     model=get_openai_llm(),
+    description="Returns mock hotel records, standing in for a real SQL agent.",
     instruction="You are a database agent. When asked for data, return this mock JSON object: {'status': 'success', 'data': [{'name': 'The Grand Hotel', 'rating': 5, 'reviews': 450}, {'name': 'Seaside Inn', 'rating': 4, 'reviews': 620}]}",
 )
 
@@ -41,19 +41,23 @@ db_agent = Agent(
 food_critic_agent = Agent(
     name="food_critic_agent",
     model=get_openai_llm(),
+    description="Gives one witty restaurant suggestion near a location.",
     instruction="You are a snobby but brilliant food critic. You ONLY respond with a single, witty restaurant suggestion near the provided location",
 )
 
 # The Concierge knows how to use the Food Critic
-conceirge_agent = Agent(
+concierge_agent = Agent(
     name="concierge_agent",
     model=get_openai_llm(),
+    description="A five-star concierge that consults the food critic.",
     instruction="You are a five-star hotel concierge. If the user asks for a restaurant recommendation, you MUST use the `food_critic_agent` tool. Present the opinion to the user politely.",
     tools=[AgentTool(agent=food_critic_agent)],
 )
 
 
 # --- 2. Define the Tools for the Orchestrator ---
+# AgentTool declares a single string parameter named 'request', so that is the
+# key its run_async expects in `args`.
 async def call_db_agent(question: str, tool_context: ToolContext):
     """
     Use this tool FIRST to connect to the database and retrieve a list of places, like hotels or landmarks.
@@ -85,7 +89,7 @@ async def call_concierge_agent(question: str, tool_context: ToolContext):
     User's Request: {question}
     """
 
-    agent_tool = AgentTool(agent=conceirge_agent)
+    agent_tool = AgentTool(agent=concierge_agent)
     concierge_output = await agent_tool.run_async(
         args={"request": question_with_data}, tool_context=tool_context
     )
@@ -107,7 +111,9 @@ trip_data_concierge_agent = Agent(
 
     """,
     tools=[call_db_agent, call_concierge_agent],
-    )
+)
+
+root_agent = trip_data_concierge_agent  # discovered by `adk web`
 
 print(f"✅ Orchestrator Agent '{trip_data_concierge_agent.name}' is defined and ready.")
 
@@ -131,20 +137,21 @@ async def run_agent_query(
                 # Let's see what the agent is thinking!
                 print(f"EVENT: {event}")
 
-                if (
-                    event.is_final_response()
-                    and event.content
-                    and event.content.parts
-                    and event.content.parts[0].text
-                    ):
-                    final_response = event.content.parts[0].text
+            # NOTE: this check must sit OUTSIDE the `if not is_router` block above,
+            # or the return value is always empty when is_router=True.
+            if (
+                event.is_final_response()
+                and event.content
+                and event.content.parts
+                and event.content.parts[0].text
+            ):
+                final_response = event.content.parts[0].text
     except Exception as e:
         final_response = f"An error occurred: {e}"
 
     if not is_router:
         print("\n" + "-" * 50)
         print("✅ Final Response:")
-        # display(Markdown(final_response))
         print(final_response)
         print("-" * 50 + "\n")
 
@@ -156,7 +163,6 @@ async def test_trip_data_concierge_agent():
     Sets up a session and runs a query against the top-level
     trip_data_concierge_agent.
     """
-    
     # Create a new, single-use session for this query
     concierge_session = await session_service.create_session(
         app_name=trip_data_concierge_agent.name, user_id=my_user_id
@@ -175,8 +181,8 @@ async def test_trip_data_concierge_agent():
 
 
 async def main() -> None:
-
     await test_trip_data_concierge_agent()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
