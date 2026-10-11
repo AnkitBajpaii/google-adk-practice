@@ -26,5 +26,3 @@ select = [
   "B",             # bugbear
 ]
 ignore = ["E501"]  # long strings/comments; the formatter doesn't wrap these
-
-
