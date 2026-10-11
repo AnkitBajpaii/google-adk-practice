@@ -10,3 +10,21 @@ dependencies = [
     "requests>=2.34.2",
     "wikipedia>=1.4.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",   # pycodestyle + pyflakes
+  "I",             # import sorting
+  "B",             # bugbear
+]
+ignore = ["E501"]  # long strings/comments; the formatter doesn't wrap these
+
+
